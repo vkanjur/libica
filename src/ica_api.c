@@ -1228,12 +1228,60 @@ unsigned int ica_rsa_mod_expo(ica_adapter_handle_t adapter_handle,
 	return rc;
 }
 
+/*
+ * Constant-time helpers for ica_rsa_crt_key_check(). p and q are secret, so
+ * neither the comparison nor the swap may branch on their values.
+ */
+
+/* Returns 1 if the big-endian number a is less than b, otherwise 0. */
+static unsigned int ct_less_than(const unsigned char *a, const unsigned char *b,
+				 size_t len)
+{
+	unsigned int lt = 0, gt = 0, undecided;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		undecided = (lt | gt) ^ 1;
+		lt |= (((unsigned int)a[i] - b[i]) >> 31) & undecided;
+		gt |= (((unsigned int)b[i] - a[i]) >> 31) & undecided;
+	}
+
+	return lt;
+}
+
+/* Swaps a and b if mask is 0xff, leaves them unchanged if mask is 0x00. */
+static void ct_cond_swap(unsigned char *a, unsigned char *b, size_t len,
+			 unsigned char mask)
+{
+	unsigned char t;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		t = (a[i] ^ b[i]) & mask;
+		a[i] ^= t;
+		b[i] ^= t;
+	}
+}
+
+/* Copies src to dst if mask is 0xff, leaves dst unchanged if mask is 0x00. */
+static void ct_cond_copy(unsigned char *dst, const unsigned char *src,
+			 size_t len, unsigned char mask)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		dst[i] = (dst[i] & (unsigned char)~mask) | (src[i] & mask);
+}
+
 unsigned int ica_rsa_crt_key_check(ica_rsa_key_crt_t *rsa_key)
 {
-	int pq_comp;
+	size_t half;
+	unsigned int swap;
+	unsigned char mask;
 	BIGNUM *bn_p;
 	BIGNUM *bn_q;
 	BIGNUM *bn_invq;
+	BIGNUM *bn_exp;
 	BN_CTX *ctx;
 	unsigned char *tmp_buf = NULL;
 	unsigned int rc;
@@ -1249,62 +1297,77 @@ unsigned int ica_rsa_crt_key_check(ica_rsa_key_crt_t *rsa_key)
 		errno_tmp = EPERM;
 #endif /* ICA_FIPS */
 
-	/* check if p > q  */
-	pq_comp = memcmp( (rsa_key->p + 8), (rsa_key->q), rsa_key->key_length / 2);
-	if (pq_comp >= 0) /* privileged key format, p and q ok */
-		return 0;
+	half = rsa_key->key_length / 2;
 
-	/* unprivileged key format: swap p and q */
-	tmp_buf = calloc(1, rsa_key->key_length / 2);
+	tmp_buf = calloc(1, half);
 	if (!tmp_buf)
 		return ENOMEM;
 
 	bn_p = BN_secure_new();
 	bn_q = BN_secure_new();
 	bn_invq = BN_secure_new();
+	bn_exp = BN_secure_new();
 	ctx = BN_CTX_new();
-	if (!bn_p || !bn_q || !bn_invq || !ctx) {
+	if (!bn_p || !bn_q || !bn_invq || !bn_exp || !ctx) {
 		rc = ENOMEM;
 		goto done;
 	}
 
-	/* swap p and q */
-	memcpy(tmp_buf, rsa_key->p + 8, rsa_key->key_length / 2);
-	memcpy(rsa_key->p + 8, rsa_key->q, rsa_key->key_length / 2);
-	memcpy(rsa_key->q, tmp_buf, rsa_key->key_length / 2);
+	/*
+	 * Unprivileged key format (p < q): swap p and q, and dp and dq. The
+	 * same work is done for every key and the swap is applied through a
+	 * mask, so that the timing does not reveal which prime is larger.
+	 */
+	swap = ct_less_than(rsa_key->p + 8, rsa_key->q, half);
+	mask = (unsigned char)(0 - swap);
 
-	/* swap dp and dq */
-	memcpy(tmp_buf, rsa_key->dp + 8, rsa_key->key_length / 2);
-	memcpy(rsa_key->dp + 8, rsa_key->dq, rsa_key->key_length / 2);
-	memcpy(rsa_key->dq, tmp_buf, rsa_key->key_length / 2);
+	ct_cond_swap(rsa_key->p + 8, rsa_key->q, half, mask);
+	ct_cond_swap(rsa_key->dp + 8, rsa_key->dq, half, mask);
 
-	if (BN_bin2bn(rsa_key->p, rsa_key->key_length / 2 + 8, bn_p) == NULL ||
-		BN_bin2bn(rsa_key->q, rsa_key->key_length / 2, bn_q) == NULL) {
-		rc = EFAULT;
+	/*
+	 * Failures below can only happen for malformed keys. A key that needs
+	 * no swap was accepted without any check before, so keep accepting it.
+	 */
+	if (BN_bin2bn(rsa_key->p, half + 8, bn_p) == NULL ||
+		BN_bin2bn(rsa_key->q, half, bn_q) == NULL) {
+		rc = swap ? EFAULT : 0;
 		goto done;
 	}
 
-	/* qInv = (1/q) mod p */
-	if (BN_mod_inverse(bn_invq, bn_q, bn_p, ctx) == NULL) {
-		rc = EFAULT;
+	/*
+	 * qInv = (1/q) mod p = q^(p-2) mod p (p is prime). BN_mod_inverse()
+	 * is variable-time on the secret primes, even with BN_FLG_CONSTTIME,
+	 * so use a constant-time modular exponentiation instead.
+	 */
+	if (BN_copy(bn_exp, bn_p) == NULL || !BN_sub_word(bn_exp, 2)) {
+		rc = swap ? EFAULT : 0;
 		goto done;
 	}
-	memset(tmp_buf, 0, rsa_key->key_length / 2);
-	if (BN_bn2binpad(bn_invq, tmp_buf, rsa_key->key_length / 2) <= 0) {
-		rc = EFAULT;
+	BN_set_flags(bn_exp, BN_FLG_CONSTTIME);
+	if (!BN_mod_exp_mont_consttime(bn_invq, bn_q, bn_exp, bn_p, ctx,
+				       NULL)) {
+		rc = swap ? EFAULT : 0;
 		goto done;
 	}
-	memcpy(rsa_key->qInverse + 8, tmp_buf, rsa_key->key_length / 2);
+	memset(tmp_buf, 0, half);
+	if (BN_bn2binpad(bn_invq, tmp_buf, half) <= 0) {
+		rc = swap ? EFAULT : 0;
+		goto done;
+	}
 
-	rc = 1;
+	/* Replace qInverse only if p and q were swapped. */
+	ct_cond_copy(rsa_key->qInverse + 8, tmp_buf, half, mask);
+
+	rc = swap;	/* 0: key unchanged, 1: key was normalised */
 
 done:
-	OPENSSL_cleanse(tmp_buf, rsa_key->key_length / 2);
+	OPENSSL_cleanse(tmp_buf, half);
 	free(tmp_buf);
 	BN_CTX_free(ctx);
 	BN_clear_free(bn_p);
 	BN_clear_free(bn_q);
 	BN_clear_free(bn_invq);
+	BN_clear_free(bn_exp);
 
 #ifdef ICA_FIPS
 	errno = errno_tmp;
