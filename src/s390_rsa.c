@@ -656,6 +656,16 @@ static unsigned int mod_expo_sw(int arg_length, unsigned char *arg, int exp_leng
 	b_exp = BN_bin2bn((const unsigned char *)exp, exp_length, b_exp);
 	b_mod = BN_bin2bn((const unsigned char *)mod, mod_length, b_mod);
 
+	if (b_exp == NULL)
+		goto err;
+
+	/*
+	 * The exponent is secret (d, dp or dq). Without BN_FLG_CONSTTIME,
+	 * BN_mod_exp() uses a variable-time sliding-window exponentiation
+	 * that leaks the exponent through timing.
+	 */
+	BN_set_flags(b_exp, BN_FLG_CONSTTIME);
+
 	// Evidently BN_mod_exp gets a *lot* of temp BN's, so it
 	// needs a context all its own.
 	if ((mod_expo_ctx = BN_CTX_new()) == NULL) {
